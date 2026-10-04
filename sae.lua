@@ -5,9 +5,13 @@
 ]]
 
 -- ── GUARD ─────────────────────────────────────────────────────────────────
-if game.PlaceId ~= 10563114921 then
-    warn("[Noa Hub] Wrong game. PlaceId harus 10563114921.")
-    return
+-- Accept PlaceId 10563114921 (root place) OR game universeId check
+local VALID_PLACE_IDS = { [10563114921]=true }
+if not VALID_PLACE_IDS[game.PlaceId] then
+    -- Try universe ID fallback
+    local uid = game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId)
+    -- Soft warn, don't hard stop in case of sub-places
+    warn("[Noa Hub] PlaceId "..game.PlaceId.." mungkin bukan Steal An Egg utama. Lanjut...")
 end
 
 -- ── SERVICES ──────────────────────────────────────────────────────────────
@@ -115,13 +119,94 @@ local function notify(title, text, dur)
     end)
 end
 
--- ── POSITIONS ─────────────────────────────────────────────────────────────
-local BIOME_POS = {
-    Forest   = Vector3.new(-200, 5, 100),
-    Plains   = Vector3.new(50,   5, 300),
-    Mountain = Vector3.new(-400, 80, -150),
-}
-local SHOP_POS = Vector3.new(0, 5, 0)  -- sesuaikan
+-- ── AUTO-DETECT POSITIONS ─────────────────────────────────────────────────
+local _detectedShop = nil
+local _detectedBiome = {}
+
+local function detectShopPos()
+    if _detectedShop then return _detectedShop end
+    local keywords = {"shop","store","nestshop","safezon","spawn","base","treadmill","seller","sell"}
+    -- Priority: SpawnLocation first
+    for _,obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("SpawnLocation") then
+            _detectedShop = obj.Position + Vector3.new(0,3,0)
+            print("[Noa Hub] Shop auto-detected (SpawnLocation):", tostring(_detectedShop))
+            return _detectedShop
+        end
+    end
+    -- Then named parts/models
+    for _,obj in ipairs(workspace:GetDescendants()) do
+        local n = obj.Name:lower()
+        for _,kw in ipairs(keywords) do
+            if n:find(kw) then
+                local pos
+                if obj:IsA("BasePart") then pos = obj.Position
+                elseif obj:IsA("Model") then
+                    local cf = obj:FindFirstChildWhichIsA("BasePart")
+                    if cf then pos = cf.Position end
+                end
+                if pos then
+                    _detectedShop = pos + Vector3.new(0,3,0)
+                    print("[Noa Hub] Shop auto-detected ("..obj.Name.."):", tostring(_detectedShop))
+                    return _detectedShop
+                end
+            end
+        end
+    end
+    -- Fallback to player spawn
+    local hrp = getHRP()
+    _detectedShop = hrp and hrp.Position or Vector3.new(0,5,0)
+    warn("[Noa Hub] Shop tidak ditemukan, pakai posisi player.")
+    return _detectedShop
+end
+
+local function detectBiomePos(biome)
+    if _detectedBiome[biome] then return _detectedBiome[biome] end
+    local keywords = {
+        Forest   = {"forest","jungle","tree","wood","leaf","biome.*forest","forest.*biome"},
+        Plains   = {"plain","grass","meadow","field","open","biome.*plain","plain.*biome"},
+        Mountain = {"mountain","hill","cliff","peak","snow","ice","biome.*mount","mount.*biome"},
+    }
+    local kws = keywords[biome] or {}
+    -- Search Folder first (biome folders common in Roblox games)
+    for _,obj in ipairs(workspace:GetChildren()) do
+        if obj:IsA("Folder") or obj:IsA("Model") then
+            local n = obj.Name:lower()
+            for _,kw in ipairs(kws) do
+                if n:find(kw) then
+                    local cf = obj:FindFirstChildWhichIsA("BasePart")
+                    if cf then
+                        _detectedBiome[biome] = cf.Position + Vector3.new(0,5,0)
+                        print("[Noa Hub] Biome "..biome.." detected ("..obj.Name.."):", tostring(_detectedBiome[biome]))
+                        return _detectedBiome[biome]
+                    end
+                end
+            end
+        end
+    end
+    -- Deep scan BaseParts
+    for _,obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            local n = obj.Name:lower()
+            for _,kw in ipairs(kws) do
+                if n:find(kw) then
+                    _detectedBiome[biome] = obj.Position + Vector3.new(0,5,0)
+                    print("[Noa Hub] Biome "..biome.." detected ("..obj.Name.."):", tostring(_detectedBiome[biome]))
+                    return _detectedBiome[biome]
+                end
+            end
+        end
+    end
+    -- Fallbacks
+    local fallbacks = { Forest=Vector3.new(-200,5,100), Plains=Vector3.new(50,5,300), Mountain=Vector3.new(-400,80,-150) }
+    _detectedBiome[biome] = fallbacks[biome]
+    warn("[Noa Hub] Biome "..biome.." tidak ditemukan, pakai fallback.")
+    return _detectedBiome[biome]
+end
+
+-- Lazy wrappers used throughout script
+local function SHOP_POS() return detectShopPos() end
+local function BIOME_POS(b) return detectBiomePos(b) end
 
 -- ── UTILITY ───────────────────────────────────────────────────────────────
 local function teleportTo(pos)
@@ -192,20 +277,63 @@ end
 local function isGuardianNear(r) return nearestGuardDist() < (r or 30) end
 
 -- ── TOOLS ─────────────────────────────────────────────────────────────────
-local function findTool(keywords)
+-- Auto-detect tools by scanning all tools and scoring relevance
+local function findTool(keywords, scoreMode)
+    local best, bestScore = nil, -1
     for _,c in ipairs({lp:FindFirstChild("Backpack"), getChar()}) do
         if c then
             for _,t in ipairs(c:GetChildren()) do
                 if t:IsA("Tool") then
                     local n = t.Name:lower()
-                    for _,kw in ipairs(keywords) do if n:find(kw) then return t end end
+                    local score = 0
+                    for i,kw in ipairs(keywords) do
+                        if n:find(kw) then
+                            -- Earlier in keyword list = higher priority
+                            score = score + (#keywords - i + 1)
+                        end
+                    end
+                    if score > bestScore then best=t bestScore=score end
                 end
             end
         end
     end
+    return best
 end
-local function getStealTool() return findTool({"steal","grab","pick"}) end
-local function getClubTool()  return findTool({"club","bat","stick","pentungan","bonk","mallet","hammer"}) end
+
+-- Auto-detect steal tool: scan for egg-related tool in char hands first
+local function getStealTool()
+    -- First check if player is already holding an egg tool
+    local c = getChar()
+    if c then
+        for _,t in ipairs(c:GetChildren()) do
+            if t:IsA("Tool") and t.Name:lower():find("egg") then return t end
+        end
+    end
+    -- Then find by keywords
+    return findTool({"steal","egg","grab","snatch","pick","take","swipe","thief","heist"})
+end
+
+-- Auto-detect club/attack tool
+local function getClubTool()
+    return findTool({
+        "pentungan","club","bonk","bat","mallet","hammer","stick",
+        "weapon","attack","hit","swing","smash","whack","bop","wand","staff"
+    })
+end
+
+-- Run detection on load and cache result
+task.spawn(function()
+    task.wait(3) -- wait for game to fully load
+    detectShopPos()
+    for _,b in ipairs({"Forest","Plains","Mountain"}) do
+        detectBiomePos(b)
+    end
+    print("[Noa Hub] Auto-detect selesai.")
+    print("  Shop :", tostring(_detectedShop))
+    print("  Forest:", tostring(_detectedBiome.Forest))
+    print("  Plains:", tostring(_detectedBiome.Plains))
+    print("  Mountain:", tostring(_detectedBiome.Mountain))
+end)
 local function equipTool(t)   local h=getHum() if h and t then h:EquipTool(t) end end
 local function unequipTools() local h=getHum() if h then h:UnequipTools() end end
 
@@ -280,7 +408,7 @@ local function forestDrop_cycle()
     end
     moveZigzag(eggPos+Vector3.new(0,3,0),CFG.CloneSpeed,nil) task.wait(0.5)
     local tool=getStealTool() if tool then equipTool(tool) task.wait(0.3) end
-    local fp = BIOME_POS[CFG.ForestBiome] or BIOME_POS.Forest
+    local fp = BIOME_POS(CFG.ForestBiome) or BIOME_POS("Forest")
     if CFG.GuardianCheck then
         local w=0 while isGuardianNear(40) and w<10 do task.wait(1) w+=1 end
     end
@@ -324,7 +452,7 @@ local function autoSteal_cycle()
     moveByStyle(eggPos,nil) task.wait(CFG.StealDelay)
     local t=getStealTool() if t then equipTool(t) task.wait(0.3) end
     if CFG.AutoDrop then
-        moveTween(SHOP_POS,CFG.StealSpeed,function() unequipTools() end) task.wait(0.5)
+        moveTween(SHOP_POS(),CFG.StealSpeed,function() unequipTools() end) task.wait(0.5)
     end
     if CFG.AutoTreadmill2 then
         for _,obj in ipairs(workspace:GetDescendants()) do
@@ -569,7 +697,7 @@ local function stealFromPlayer(entry)
         local st=getStealTool() if st then equipTool(st) task.wait(0.3) end
         if CFG.PVP.RunAfter then
             local hum2=getHum() if hum2 then hum2.WalkSpeed=CFG.StealSpeed end
-            moveZigzag(SHOP_POS,CFG.StealSpeed,function()
+            moveZigzag(SHOP_POS(),CFG.StealSpeed,function()
                 unequipTools()
                 CFG.PVP.Stolen+=1
                 notify("Noa Hub","Berhasil curi "..entry.rarity.." Egg dari "..tgt.Name.."!")
@@ -921,7 +1049,7 @@ makeToggle(pgForest,"Notifikasi Saat Drop","Popup setiap egg berhasil di-drop",t
 secLabel(pgForest,"KONTROL")
 local fStatusLbl=lbl(pgForest,"Status: OFF",9,C.t2,{Size=UDim2.new(1,0,0,16),LayoutOrder=nextLo()})
 local fStartBtn=makeButton(pgForest,"Mulai Forest Drop",Color3.fromRGB(35,85,35),function()
-    if CFG.AutoTPForest then teleportTo(BIOME_POS[CFG.ForestBiome] or BIOME_POS.Forest) end
+    if CFG.AutoTPForest then teleportTo(BIOME_POS(CFG.ForestBiome) or BIOME_POS("Forest")) end
     CFG.MoveStyle="ForestDrop"
     startForestDrop()
     fStatusLbl.Text="Status: RUNNING"
@@ -946,7 +1074,7 @@ makeButton(pgForest,"Stop Forest Drop",Color3.fromRGB(60,25,30),function()
     notify("Noa Hub","Forest Drop dihentikan.")
 end)
 makeButton(pgForest,"TP ke Biome Sekarang",C.bg5,function()
-    teleportTo(BIOME_POS[CFG.ForestBiome] or BIOME_POS.Forest)
+    teleportTo(BIOME_POS(CFG.ForestBiome) or BIOME_POS("Forest"))
     notify("Noa Hub","Teleport ke "..CFG.ForestBiome.."!")
 end)
 
@@ -1101,7 +1229,7 @@ local qBtnF=mk("Frame",{Size=UDim2.new(1,0,0,30),BackgroundTransparency=1,Layout
 mk("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,5),Parent=qBtnF})
 local tpBtn=mk("TextButton",{Size=UDim2.new(0.5,-3,1,0),BackgroundColor3=C.bg5,BorderSizePixel=0,Text="TP ke Base",TextSize=11,TextColor3=C.t0,Font=Enum.Font.GothamBold,Parent=qBtnF})
 corner(tpBtn,7) stroke(tpBtn,Color3.new(1,1,1),1)
-tpBtn.MouseButton1Click:Connect(function() teleportTo(SHOP_POS) notify("Noa Hub","TP ke base!") end)
+tpBtn.MouseButton1Click:Connect(function() teleportTo(SHOP_POS()) notify("Noa Hub","TP ke base!") end)
 local rjBtn=mk("TextButton",{Size=UDim2.new(0.5,-3,1,0),BackgroundColor3=C.bg5,BorderSizePixel=0,Text="Rejoin",TextSize=11,TextColor3=C.t0,Font=Enum.Font.GothamBold,Parent=qBtnF})
 corner(rjBtn,7) stroke(rjBtn,Color3.new(1,1,1),1)
 rjBtn.MouseButton1Click:Connect(function() pcall(function() game:GetService("TeleportService"):Teleport(game.PlaceId,lp) end) end)
@@ -1147,13 +1275,15 @@ UserInputService.InputBegan:Connect(function(i,gpe)
         notify("Noa Hub","PANIC STOP: semua fungsi dihentikan.")
     end
     if i.KeyCode==Enum.KeyCode.F10 then
-        teleportTo(SHOP_POS)
+        teleportTo(SHOP_POS())
         notify("Noa Hub","Quick TP ke base!")
     end
 end)
 
 -- Public API
 getgenv().NoaHub = {
+    DetectShop=detectShopPos,
+    DetectBiome=detectBiomePos,
     CFG=CFG, SaveConfig=saveConfig, LoadConfig=loadConfig,
     StartAutoSteal=startAutoSteal, StopAutoSteal=stopAutoSteal,
     StartForestDrop=startForestDrop, StopForestDrop=stopForestDrop,
@@ -1161,5 +1291,5 @@ getgenv().NoaHub = {
     TP=teleportTo, ScanPlayers=scanPlayersEggs,
 }
 
-notify("Noa Hub","v2.0 loaded \xe2\x80\x94 Steal An Egg siap!")
+notify("Noa Hub","v2.0 loaded \xe2\x80\x94 Steal An Egg | Auto-detect aktif")
 print("[Noa Hub] v2.0 loaded. API: getgenv().NoaHub")
